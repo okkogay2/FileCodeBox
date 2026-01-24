@@ -70,7 +70,7 @@ class FileService:
 
 class ConfigService:
     def get_config(self):
-        return settings.items()
+        return dict(settings.items())
 
     async def update_config(self, data: dict):
         admin_token = data.get("admin_token")
