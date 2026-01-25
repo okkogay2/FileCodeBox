@@ -4,6 +4,8 @@
 # @Software: PyCharm
 import base64
 import hashlib
+import os
+import tempfile
 from core.logger import logger
 import shutil
 from typing import Optional
@@ -14,7 +16,6 @@ import aiohttp
 import asyncio
 from pathlib import Path
 import datetime
-import io
 import re
 import aioboto3
 from botocore.config import Config
@@ -285,11 +286,12 @@ class S3FileStorage(FileStorageInterface):
                 region_name=self.region_name,
                 config=Config(signature_version=self.signature_version),
         ) as s3:
-            await s3.put_object(
-                Bucket=self.bucket_name,
-                Key=save_path,
-                Body=await file.read(),
-                ContentType=file.content_type,
+            # 使用 upload_fileobj 流式上传，避免将整个文件加载到内存
+            await s3.upload_fileobj(
+                file.file,
+                self.bucket_name,
+                save_path,
+                ExtraArgs={"ContentType": file.content_type or "application/octet-stream"},
             )
 
     async def delete_file(self, file_code: FileCodes):
@@ -425,12 +427,11 @@ class S3FileStorage(FileStorageInterface):
     async def merge_chunks(self, upload_id: str, chunk_info: UploadChunk, save_path: str) -> tuple[str, str]:
         """
         合并 S3 上的分片文件
-        由于分片是独立对象存储的，需要下载后合并再上传
+        使用 S3 的 multipart upload API 实现流式合并，避免内存问题
         """
         file_sha256 = hashlib.sha256()
         chunk_dir = str(Path(save_path).parent / "chunks" / upload_id)
-        merged_data = io.BytesIO()
-        
+
         async with self.session.client(
             's3',
             endpoint_url=self.endpoint_url,
@@ -438,38 +439,70 @@ class S3FileStorage(FileStorageInterface):
             region_name=self.region_name,
             config=Config(signature_version=self.signature_version),
         ) as s3:
-            # 按顺序读取并验证每个分片
-            for i in range(chunk_info.total_chunks):
-                chunk_key = f"{chunk_dir}/{i}.part"
-                chunk_record = await UploadChunk.filter(upload_id=upload_id, chunk_index=i).first()
-                if not chunk_record:
-                    raise ValueError(f"分片{i}记录不存在")
-                
-                try:
-                    response = await s3.get_object(
-                        Bucket=self.bucket_name,
-                        Key=chunk_key
-                    )
-                    chunk_data = await response['Body'].read()
-                except Exception as e:
-                    raise ValueError(f"分片{i}文件不存在: {e}")
-                
-                current_hash = hashlib.sha256(chunk_data).hexdigest()
-                if current_hash != chunk_record.chunk_hash:
-                    raise ValueError(f"分片{i}哈希不匹配: 期望 {chunk_record.chunk_hash}, 实际 {current_hash}")
-                
-                file_sha256.update(chunk_data)
-                merged_data.write(chunk_data)
-            
-            # 上传合并后的文件
-            merged_data.seek(0)
-            await s3.put_object(
+            # 创建 multipart upload
+            mpu = await s3.create_multipart_upload(
                 Bucket=self.bucket_name,
                 Key=save_path,
-                Body=merged_data.getvalue(),
                 ContentType='application/octet-stream'
             )
-        
+            mpu_id = mpu['UploadId']
+            parts = []
+
+            try:
+                # 按顺序读取、验证并上传每个分片
+                for i in range(chunk_info.total_chunks):
+                    chunk_key = f"{chunk_dir}/{i}.part"
+                    chunk_record = await UploadChunk.filter(upload_id=upload_id, chunk_index=i).first()
+                    if not chunk_record:
+                        raise ValueError(f"分片{i}记录不存在")
+
+                    try:
+                        response = await s3.get_object(
+                            Bucket=self.bucket_name,
+                            Key=chunk_key
+                        )
+                        chunk_data = await response['Body'].read()
+                    except Exception as e:
+                        raise ValueError(f"分片{i}文件不存在: {e}")
+
+                    current_hash = hashlib.sha256(chunk_data).hexdigest()
+                    if current_hash != chunk_record.chunk_hash:
+                        raise ValueError(f"分片{i}哈希不匹配: 期望 {chunk_record.chunk_hash}, 实际 {current_hash}")
+
+                    file_sha256.update(chunk_data)
+
+                    # 上传分片到 multipart upload
+                    part_response = await s3.upload_part(
+                        Bucket=self.bucket_name,
+                        Key=save_path,
+                        UploadId=mpu_id,
+                        PartNumber=i + 1,  # S3 part numbers start at 1
+                        Body=chunk_data
+                    )
+                    parts.append({
+                        'PartNumber': i + 1,
+                        'ETag': part_response['ETag']
+                    })
+
+                    # 释放内存
+                    del chunk_data
+
+                # 完成 multipart upload
+                await s3.complete_multipart_upload(
+                    Bucket=self.bucket_name,
+                    Key=save_path,
+                    UploadId=mpu_id,
+                    MultipartUpload={'Parts': parts}
+                )
+            except Exception as e:
+                # 出错时取消 multipart upload
+                await s3.abort_multipart_upload(
+                    Bucket=self.bucket_name,
+                    Key=save_path,
+                    UploadId=mpu_id
+                )
+                raise e
+
         return save_path, file_sha256.hexdigest()
 
     async def clean_chunks(self, upload_id: str, save_path: str):
@@ -762,33 +795,44 @@ class OneDriveFileStorage(FileStorageInterface):
         current_folder.upload(filename, data).execute_query()
 
     async def merge_chunks(self, upload_id: str, chunk_info: UploadChunk, save_path: str) -> tuple[str, str]:
-        """合并 OneDrive 上的分片文件"""
+        """合并 OneDrive 上的分片文件，使用临时文件避免内存问题"""
         file_sha256 = hashlib.sha256()
         chunk_dir = str(Path(save_path).parent / "chunks" / upload_id)
-        merged_data = io.BytesIO()
-        
-        for i in range(chunk_info.total_chunks):
-            chunk_path = f"{chunk_dir}/{i}.part"
-            chunk_record = await UploadChunk.filter(upload_id=upload_id, chunk_index=i).first()
-            if not chunk_record:
-                raise ValueError(f"分片{i}记录不存在")
-            
-            try:
-                chunk_data = await asyncio.to_thread(self._read_chunk, chunk_path)
-            except Exception as e:
-                raise ValueError(f"分片{i}文件不存在: {e}")
-            
-            current_hash = hashlib.sha256(chunk_data).hexdigest()
-            if current_hash != chunk_record.chunk_hash:
-                raise ValueError(f"分片{i}哈希不匹配: 期望 {chunk_record.chunk_hash}, 实际 {current_hash}")
-            
-            file_sha256.update(chunk_data)
-            merged_data.write(chunk_data)
-        
-        # 上传合并后的文件
-        merged_data.seek(0)
-        await asyncio.to_thread(self._upload_merged, save_path, merged_data.getvalue())
-        
+
+        # 使用临时文件存储合并数据
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_path = temp_file.name
+
+        try:
+            async with aiofiles.open(temp_path, 'wb') as out_file:
+                for i in range(chunk_info.total_chunks):
+                    chunk_path = f"{chunk_dir}/{i}.part"
+                    chunk_record = await UploadChunk.filter(upload_id=upload_id, chunk_index=i).first()
+                    if not chunk_record:
+                        raise ValueError(f"分片{i}记录不存在")
+
+                    try:
+                        chunk_data = await asyncio.to_thread(self._read_chunk, chunk_path)
+                    except Exception as e:
+                        raise ValueError(f"分片{i}文件不存在: {e}")
+
+                    current_hash = hashlib.sha256(chunk_data).hexdigest()
+                    if current_hash != chunk_record.chunk_hash:
+                        raise ValueError(f"分片{i}哈希不匹配: 期望 {chunk_record.chunk_hash}, 实际 {current_hash}")
+
+                    file_sha256.update(chunk_data)
+                    await out_file.write(chunk_data)
+                    del chunk_data  # 释放内存
+
+            # 读取临时文件并上传
+            async with aiofiles.open(temp_path, 'rb') as f:
+                merged_content = await f.read()
+            await asyncio.to_thread(self._upload_merged, save_path, merged_content)
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
         return save_path, file_sha256.hexdigest()
 
     def _delete_chunk_dir(self, chunk_dir: str):
@@ -845,7 +889,9 @@ class OpenDALFileStorage(FileStorageInterface):
         )
 
     async def save_file(self, file: UploadFile, save_path: str):
-        await self.operator.write(save_path, file.file.read())
+        # 使用 asyncio.to_thread 避免阻塞事件循环
+        content = await asyncio.to_thread(file.file.read)
+        await self.operator.write(save_path, content)
 
     async def delete_file(self, file_code: FileCodes):
         await self.operator.delete(await file_code.get_file_path())
@@ -915,32 +961,43 @@ class OpenDALFileStorage(FileStorageInterface):
         await self.operator.write(chunk_path, chunk_data)
 
     async def merge_chunks(self, upload_id: str, chunk_info: UploadChunk, save_path: str) -> tuple[str, str]:
-        """合并 OpenDAL 存储上的分片文件"""
+        """合并 OpenDAL 存储上的分片文件，使用临时文件避免内存问题"""
         file_sha256 = hashlib.sha256()
         chunk_dir = str(Path(save_path).parent / "chunks" / upload_id)
-        merged_data = io.BytesIO()
-        
-        for i in range(chunk_info.total_chunks):
-            chunk_path = f"{chunk_dir}/{i}.part"
-            chunk_record = await UploadChunk.filter(upload_id=upload_id, chunk_index=i).first()
-            if not chunk_record:
-                raise ValueError(f"分片{i}记录不存在")
-            
-            try:
-                chunk_data = await self.operator.read(chunk_path)
-            except Exception as e:
-                raise ValueError(f"分片{i}文件不存在: {e}")
-            
-            current_hash = hashlib.sha256(chunk_data).hexdigest()
-            if current_hash != chunk_record.chunk_hash:
-                raise ValueError(f"分片{i}哈希不匹配: 期望 {chunk_record.chunk_hash}, 实际 {current_hash}")
-            
-            file_sha256.update(chunk_data)
-            merged_data.write(chunk_data)
-        
-        # 写入合并后的文件
-        merged_data.seek(0)
-        await self.operator.write(save_path, merged_data.getvalue())
+
+        # 使用临时文件存储合并数据
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_path = temp_file.name
+
+        try:
+            async with aiofiles.open(temp_path, 'wb') as out_file:
+                for i in range(chunk_info.total_chunks):
+                    chunk_path = f"{chunk_dir}/{i}.part"
+                    chunk_record = await UploadChunk.filter(upload_id=upload_id, chunk_index=i).first()
+                    if not chunk_record:
+                        raise ValueError(f"分片{i}记录不存在")
+
+                    try:
+                        chunk_data = await self.operator.read(chunk_path)
+                    except Exception as e:
+                        raise ValueError(f"分片{i}文件不存在: {e}")
+
+                    current_hash = hashlib.sha256(chunk_data).hexdigest()
+                    if current_hash != chunk_record.chunk_hash:
+                        raise ValueError(f"分片{i}哈希不匹配: 期望 {chunk_record.chunk_hash}, 实际 {current_hash}")
+
+                    file_sha256.update(chunk_data)
+                    await out_file.write(chunk_data)
+                    del chunk_data  # 释放内存
+
+            # 读取临时文件并写入存储
+            async with aiofiles.open(temp_path, 'rb') as f:
+                merged_content = await f.read()
+            await self.operator.write(save_path, merged_content)
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
         
         return save_path, file_sha256.hexdigest()
 
@@ -1033,7 +1090,7 @@ class WebDAVFileStorage(FileStorageInterface):
             current_path = current_path.parent
 
     async def save_file(self, file: UploadFile, save_path: str):
-        """保存文件（自动创建目录）"""
+        """保存文件（自动创建目录，流式上传）"""
         path_obj = Path(save_path)
         directory_path = str(path_obj.parent)
         # 提取原始文件名并进行清理
@@ -1044,13 +1101,23 @@ class WebDAVFileStorage(FileStorageInterface):
         try:
             # 先创建目录结构
             await self._mkdir_p(directory_path)
-            # 上传文件
+            # 上传文件（流式）
             url = self._build_url(safe_save_path)
+
+            async def file_sender():
+                """流式读取文件内容"""
+                chunk_size = 256 * 1024  # 256KB chunks
+                while True:
+                    chunk = await asyncio.to_thread(file.file.read, chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+
             async with aiohttp.ClientSession(auth=self.auth) as session:
-                content = await file.read()
                 async with session.put(
-                        url, data=content, headers={
-                            "Content-Type": file.content_type}
+                        url,
+                        data=file_sender(),
+                        headers={"Content-Type": file.content_type or "application/octet-stream"}
                 ) as resp:
                     if resp.status not in (200, 201, 204):
                         content = await resp.text()
@@ -1161,52 +1228,70 @@ class WebDAVFileStorage(FileStorageInterface):
     async def merge_chunks(self, upload_id: str, chunk_info: UploadChunk, save_path: str) -> tuple[str, str]:
         """
         合并 WebDAV 上的分片文件
-        由于大多数 WebDAV 服务器不支持 PATCH 追加，这里下载所有分片后合并上传
+        使用临时文件避免内存问题
         """
         file_sha256 = hashlib.sha256()
         chunk_dir = str(Path(save_path).parent / "chunks" / upload_id)
-        merged_data = io.BytesIO()
-        
-        async with aiohttp.ClientSession(auth=self.auth) as session:
-            # 按顺序读取并验证每个分片
-            for i in range(chunk_info.total_chunks):
-                chunk_path = f"{chunk_dir}/{i}.part"
-                chunk_url = self._build_url(chunk_path)
-                
-                # 获取分片记录
-                chunk_record = await UploadChunk.filter(upload_id=upload_id, chunk_index=i).first()
-                if not chunk_record:
-                    raise ValueError(f"分片{i}记录不存在")
-                
-                # 下载分片数据
-                async with session.get(chunk_url) as resp:
-                    if resp.status != 200:
-                        raise ValueError(f"分片{i}文件不存在或无法访问")
-                    chunk_data = await resp.read()
-                
-                # 验证哈希
-                current_hash = hashlib.sha256(chunk_data).hexdigest()
-                if current_hash != chunk_record.chunk_hash:
-                    raise ValueError(f"分片{i}哈希不匹配: 期望 {chunk_record.chunk_hash}, 实际 {current_hash}")
-                
-                file_sha256.update(chunk_data)
-                merged_data.write(chunk_data)
-            
-            # 确保目标目录存在
-            output_dir = str(Path(save_path).parent)
-            await self._mkdir_p(output_dir)
-            
-            # 上传合并后的文件
-            output_url = self._build_url(save_path)
-            merged_data.seek(0)
-            async with session.put(output_url, data=merged_data.getvalue()) as resp:
-                if resp.status not in (200, 201, 204):
-                    content = await resp.text()
-                    raise HTTPException(
-                        status_code=resp.status,
-                        detail=f"合并文件上传失败: {content[:200]}"
-                    )
-        
+
+        # 使用临时文件存储合并数据，避免内存问题
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_path = temp_file.name
+
+        try:
+            async with aiohttp.ClientSession(auth=self.auth) as session:
+                # 按顺序读取并验证每个分片，写入临时文件
+                async with aiofiles.open(temp_path, 'wb') as out_file:
+                    for i in range(chunk_info.total_chunks):
+                        chunk_path = f"{chunk_dir}/{i}.part"
+                        chunk_url = self._build_url(chunk_path)
+
+                        # 获取分片记录
+                        chunk_record = await UploadChunk.filter(upload_id=upload_id, chunk_index=i).first()
+                        if not chunk_record:
+                            raise ValueError(f"分片{i}记录不存在")
+
+                        # 下载分片数据
+                        async with session.get(chunk_url) as resp:
+                            if resp.status != 200:
+                                raise ValueError(f"分片{i}文件不存在或无法访问")
+                            chunk_data = await resp.read()
+
+                        # 验证哈希
+                        current_hash = hashlib.sha256(chunk_data).hexdigest()
+                        if current_hash != chunk_record.chunk_hash:
+                            raise ValueError(f"分片{i}哈希不匹配: 期望 {chunk_record.chunk_hash}, 实际 {current_hash}")
+
+                        file_sha256.update(chunk_data)
+                        await out_file.write(chunk_data)
+                        del chunk_data  # 释放内存
+
+                # 确保目标目录存在
+                output_dir = str(Path(save_path).parent)
+                await self._mkdir_p(output_dir)
+
+                # 流式上传合并后的文件
+                output_url = self._build_url(save_path)
+
+                async def file_sender():
+                    async with aiofiles.open(temp_path, 'rb') as f:
+                        while True:
+                            chunk = await f.read(256 * 1024)
+                            if not chunk:
+                                break
+                            yield chunk
+
+                async with session.put(output_url, data=file_sender()) as resp:
+                    if resp.status not in (200, 201, 204):
+                        content = await resp.text()
+                        raise HTTPException(
+                            status_code=resp.status,
+                            detail=f"合并文件上传失败: {content[:200]}"
+                        )
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
         return save_path, file_sha256.hexdigest()
 
     async def clean_chunks(self, upload_id: str, save_path: str):
