@@ -39,9 +39,9 @@ COPY --from=frontend-builder /build/fronted-2023/dist ./themes/2023
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 环境变量配置
-ENV HOST="::" \
+ENV HOST="0.0.0.0" \
     PORT=12345 \
-    WORKERS=2 \
+    WORKERS=1 \
     LOG_LEVEL="info"
 
 EXPOSE 12345
